@@ -1,25 +1,21 @@
 use futures::channel::mpsc::{Receiver, channel};
 use futures::{SinkExt, StreamExt, join};
 
-pub trait AsyncPipeline {
-    type Item;
+pub struct AsyncPipeline<Fut: Future, T> {
+    future: Fut,
+    outputs: Receiver<T>,
+}
 
-    fn into_future_and_outputs(self) -> (impl Future, Receiver<Self::Item>);
-
-    fn then<F, T>(self, mut f: F) -> Then<impl Future, T>
-    where
-        Self: Sized,
-        F: AsyncFnMut(Self::Item) -> T,
-    {
-        let (inner_future, mut inputs) = self.into_future_and_outputs();
+impl<Fut: Future, T> AsyncPipeline<Fut, T> {
+    pub fn then<F, U>(mut self, mut f: impl AsyncFnMut(T) -> U) -> AsyncPipeline<impl Future, U> {
         let (mut sender, receiver) = channel(0);
-        Then {
+        AsyncPipeline {
             future: async {
                 join! {
-                    inner_future,
+                    self.future,
                     async move {
-                        while let Some(item) = inputs.next().await {
-                            let output = f(item).await;
+                        while let Some(input) = self.outputs.next().await {
+                            let output = f(input).await;
                             sender.send(output).await.unwrap();
                         }
                     }
@@ -27,18 +23,5 @@ pub trait AsyncPipeline {
             },
             outputs: receiver,
         }
-    }
-}
-
-pub struct Then<Fut, T> {
-    future: Fut,
-    outputs: Receiver<T>,
-}
-
-impl<Fut: Future, T> AsyncPipeline for Then<Fut, T> {
-    type Item = T;
-
-    fn into_future_and_outputs(self) -> (impl Future, Receiver<Self::Item>) {
-        (self.future, self.outputs)
     }
 }
