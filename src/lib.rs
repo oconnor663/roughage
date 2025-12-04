@@ -2,21 +2,41 @@ use futures::channel::mpsc::{Receiver, Sender, channel};
 use futures::{SinkExt, Stream, StreamExt, join};
 use std::pin::pin;
 
+fn rendezvous_channel<T>() -> (RendezvousSender<T>, Receiver<T>) {
+    let (sender, receiver) = channel(0);
+    (RendezvousSender { sender }, receiver)
+}
+
+struct RendezvousSender<T> {
+    sender: Sender<T>,
+}
+
+impl<T> RendezvousSender<T> {
+    // Send an item into the `channel(0)` (which can buffer one item) and then wait for the
+    // recipient to clear it. The wait is what makes this a "rendezvous" channel.
+    async fn send_and_wait(&mut self, item: T) {
+        // Internally `futures::channel::mpsc::Sender::send` does a `flush` after sending, so we
+        // don't actually need to do anything extra here to wait for the buffer to clear. However,
+        // I find that surprising enough that I think it's worth it to wrap it in this method. See
+        // `test_rendezvous`.
+        self.sender
+            .send(item)
+            .await
+            .expect("the recipient should not drop");
+    }
+}
+
 pub fn pipeline<S: Stream>(stream: S) -> AsyncPipeline<impl Future, S::Item> {
-    let (mut sender, receiver) = channel(0);
+    let (mut sender, receiver) = rendezvous_channel();
     AsyncPipeline {
         future: async move {
             let mut stream = pin!(stream);
             while let Some(item) = stream.next().await {
-                sender.send(item).await.unwrap();
+                sender.send_and_wait(item).await;
             }
         },
         outputs: receiver,
     }
-}
-
-fn sender_is_ready<T>(sender: &mut Sender<T>) -> impl Future {
-    std::future::poll_fn(|cx| sender.poll_ready(cx))
 }
 
 pub struct AsyncPipeline<Fut: Future, T> {
@@ -26,7 +46,7 @@ pub struct AsyncPipeline<Fut: Future, T> {
 
 impl<Fut: Future, T> AsyncPipeline<Fut, T> {
     pub fn then<U>(mut self, mut f: impl AsyncFnMut(T) -> U) -> AsyncPipeline<impl Future, U> {
-        let (mut sender, receiver) = channel(0);
+        let (mut sender, receiver) = rendezvous_channel();
         AsyncPipeline {
             future: async {
                 join! {
@@ -34,8 +54,7 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
                     async move {
                         while let Some(input) = self.outputs.next().await {
                             let output = f(input).await;
-                            sender.send(output).await.unwrap();
-                            sender_is_ready(&mut sender).await;
+                            sender.send_and_wait(output).await;
                         }
                     }
                 };
@@ -108,5 +127,28 @@ mod tests {
             .collect()
             .await;
         assert_eq!(v, vec![10, 20, 30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn test_rendezvous() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static ELEMENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+        let mut i = 0;
+        pipeline(futures::stream::iter(std::iter::from_fn(|| {
+            if i < 10 {
+                let in_flight = ELEMENTS_IN_FLIGHT.fetch_add(1, Relaxed);
+                assert_eq!(in_flight, 0, "too many elements in flight at i = {i}");
+                i += 1;
+                Some(i)
+            } else {
+                None
+            }
+        })))
+        .for_each(async |i| {
+            let in_flight = ELEMENTS_IN_FLIGHT.fetch_sub(1, Relaxed);
+            assert_eq!(in_flight, 1, "too many elements in flight at i = {i}");
+            sleep(Duration::from_millis(1)).await;
+        })
+        .await;
     }
 }
