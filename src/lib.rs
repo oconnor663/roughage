@@ -1,6 +1,6 @@
 use futures::channel::mpsc::{Receiver, Sender, channel};
 use futures::future::{MaybeDone, maybe_done};
-use futures::{FutureExt, SinkExt, Stream, StreamExt, join};
+use futures::{SinkExt, Stream, StreamExt, join};
 use join_me_maybe::join_me_maybe;
 use std::collections::VecDeque;
 use std::pin::{Pin, pin};
@@ -29,12 +29,6 @@ impl<T> RendezvousSender<T> {
             .await
             .expect("receiver should not drop");
     }
-
-    async fn wait_for_space(&mut self) {
-        std::future::poll_fn(|cx| self.sender.poll_ready(cx))
-            .await
-            .expect("receiver should not drop");
-    }
 }
 
 struct ConcurrentFutures<Fut: Future> {
@@ -56,43 +50,53 @@ impl<Fut: Future> ConcurrentFutures<Fut> {
         self.futures.push_back(Box::pin(maybe_done(fut)));
     }
 
-    // Drive all the contained futures without popping any outputs. This function never completes,
-    // and it's intended to be used in a `select!` or similar with something else that will
-    // complete. If any of the contained futures are pending, then they will register for a wakeup.
-    // If not (either because all the contained futures are ready, or because this container is
-    // empty), then this function's future will yield without ever waking again.
+    // Drive all the contained futures until the first one (in order) is ready, then remove it and
+    // send its output to the provided channel. Of if this container is empty, return immediately.
     //
-    // This method is cancel-safe.
-    fn poll_without_popping(&mut self) -> impl Future {
-        std::future::poll_fn::<(), _>(|cx| {
-            for fut in &mut self.futures {
-                _ = fut.as_mut().poll(cx);
-            }
-            Poll::Pending
-        })
-    }
-
-    // Drive all the contained futures until the first one (in order) is ready, and then remove it
-    // and return its output. If this container is empty, return `None`.
-    //
-    // This method is cancel-safe.
-    fn pop_front(&mut self) -> impl Future<Output = Option<Fut::Output>> {
+    // This method is **cancel-safe**. In particular, it waits until there's space in the output
+    // channel before taking the first future's output.
+    fn await_and_send_first_output(
+        &mut self,
+        sender: &mut Sender<Fut::Output>,
+    ) -> impl Future<Output = ()> {
         std::future::poll_fn(|cx| {
-            if self.futures.is_empty() {
-                return Poll::Ready(None);
+            let mut futures_iter = self.futures.iter_mut();
+            // If the collection is empty, short-circuit.
+            let Some(first) = futures_iter.next() else {
+                return Poll::Pending;
+            };
+            // If the first future isn't ready, we won't poll the channel, because there's no point
+            // in letting it wake us up yet. In this case poll all the other `MaybeDone` futures
+            // and short-circuit. (This is critical for concurrency. Also note that polling a
+            // `MaybeDone` that's already done is a no-op.)
+            if first.as_mut().poll(cx).is_pending() {
+                for fut in futures_iter {
+                    _ = fut.as_mut().poll(cx);
+                }
+                return Poll::Pending;
             }
-            // Poll all the futures once. This is a no-op for MaybeDone futures that are already
-            // done.
-            for fut in &mut self.futures {
-                let _ = fut.as_mut().poll(cx);
+            // If the channel isn't ready, then again we'll poll all the other futures once and
+            // short-circuit. In this case the channel will eventually wake us up.
+            if !sender.poll_ready(cx).is_ready() {
+                for fut in futures_iter {
+                    _ = fut.as_mut().poll(cx);
+                }
+                return Poll::Pending;
             }
-            // If the first future is done, return its output.
-            if let Some(output) = self.futures[0].as_mut().take_output() {
-                self.futures.pop_front();
-                return Poll::Ready(Some(output));
-            }
-            // Otherwise at least the first future (and possibly others) has registered a wakeup.
-            Poll::Pending
+            // If the first future is ready *and* the channel is ready, then we can do a
+            // cancel-safe send. In this case we don't need to poll the other futures, because
+            // we're going to return Ready to the caller, so the caller won't assume that any
+            // wakeups are scheduled. (In practice, the caller will loop around and call this whole
+            // function again, possibly after pushing a new future in.)
+            let output = first
+                .as_mut()
+                .take_output()
+                .expect("already checked output ready");
+            sender
+                .start_send(output)
+                .expect("already checked channel ready, and it should never close");
+            self.futures.pop_front();
+            Poll::Ready(())
         })
     }
 }
@@ -147,48 +151,33 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
             future: async move {
                 join! {
                     self.future,
-                    async move {
+                    async {
                         let mut futures = ConcurrentFutures::new();
                         let mut inputs = self.outputs.fuse();
                         loop {
                             let futures_len = futures.len();
-                            let get_input = async {
-                                if futures_len < limit {
-                                    if let Some(input) = inputs.next().await {
-                                        input
-                                    } else {
-                                        // If the inputs stream is finished, this future never returns.
-                                        std::future::pending().await
+                            let (maybe_input, _) = join_me_maybe!(
+                                async {
+                                    if futures_len == limit {
+                                        // The collection is full. Don't take any input until the
+                                        // next output is sent. Note that `return` ends this async
+                                        // block, not the whole join or the whole function.
+                                        return None;
                                     }
-                                } else {
-                                    // If we're already at the limit, this future never returns.
-                                    std::future::pending().await
-                                }
-                            };
-                            let send_output = async {
-                                if futures_len == 0 {
-                                    // If we haven't collected any futures yet, this future never
-                                    // returns.
-                                    std::future::pending().await
-                                }
-                                // Fusing inside a select! is normally a mistake, but in this case
-                                // I claim it's fine.
-                                join_me_maybe!(
-                                    sender.wait_for_space(),
-                                    // `poll_without_popping` makes sure we keep making forward
-                                    // progress, but it never completes.
-                                    maybe futures.poll_without_popping(),
-                                );
-                                // At this point we're guaranteed to be able to `send`, so we can
-                                // get an output without worrying about dropping it.
-                                let output = futures.pop_front().await.expect("there should be futures, we just checked");
-                                sender.sender.start_send(output).expect("there should be space, we just checked");
-                            };
-                            futures::select! {
-                                input = pin!(get_input.fuse()) => {
-                                    futures.push_back(f(input));
+                                    // If we get an input, cancel the send side so that we can add
+                                    // a new future to the collection immediately. Otherwise, let
+                                    // the send side run.
+                                    if let Some(input) = inputs.next().await {
+                                        send_output.cancel();
+                                        Some(input)
+                                    } else {
+                                        None
+                                    }
                                 },
-                                _ = pin!(send_output.fuse()) => {}
+                                send_output: futures.await_and_send_first_output(&mut sender.sender),
+                            );
+                            if let Some(input) = maybe_input {
+                                futures.push_back(f(input));
                             }
                             if inputs.is_done() && futures.len() == 0 {
                                 return;
