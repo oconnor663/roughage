@@ -1,8 +1,9 @@
 use futures::channel::mpsc::{Receiver, Sender, channel};
 use futures::future::{MaybeDone, maybe_done};
-use futures::{FutureExt, SinkExt, Stream, StreamExt, join, pending, poll};
+use futures::{FutureExt, SinkExt, Stream, StreamExt, join};
 use std::collections::VecDeque;
 use std::pin::{Pin, pin};
+use std::task::Poll;
 
 fn rendezvous_channel<T>() -> (RendezvousSender<T>, Receiver<T>) {
     let (sender, receiver) = channel(0);
@@ -61,38 +62,37 @@ impl<Fut: Future> ConcurrentFutures<Fut> {
     // empty), then this function's future will yield without ever waking again.
     //
     // This method is cancel-safe.
-    async fn poll_without_popping(&mut self) -> ! {
-        loop {
+    fn poll_without_popping(&mut self) -> impl Future {
+        std::future::poll_fn::<(), _>(|cx| {
             for fut in &mut self.futures {
-                let _ = poll!(fut.as_mut());
+                _ = fut.as_mut().poll(cx);
             }
-            pending!();
-        }
+            Poll::Pending
+        })
     }
 
     // Drive all the contained futures until the first one (in order) is ready, and then remove it
     // and return its output. If this container is empty, return `None`.
     //
     // This method is cancel-safe.
-    async fn pop_front(&mut self) -> Option<Fut::Output> {
-        if self.futures.is_empty() {
-            return None;
-        }
-        loop {
+    fn pop_front(&mut self) -> impl Future<Output = Option<Fut::Output>> {
+        std::future::poll_fn(|cx| {
+            if self.futures.is_empty() {
+                return Poll::Ready(None);
+            }
             // Poll all the futures once. This is a no-op for MaybeDone futures that are already
             // done.
             for fut in &mut self.futures {
-                let _ = poll!(fut.as_mut());
+                let _ = fut.as_mut().poll(cx);
             }
             // If the first future is done, return its output.
             if let Some(output) = self.futures[0].as_mut().take_output() {
                 self.futures.pop_front();
-                return Some(output);
+                return Poll::Ready(Some(output));
             }
             // Otherwise at least the first future (and possibly others) has registered a wakeup.
-            // Yield and continue the loop after we wake up.
-            pending!();
-        }
+            Poll::Pending
+        })
     }
 }
 
