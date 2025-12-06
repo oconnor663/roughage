@@ -1,4 +1,4 @@
-use futures::channel::mpsc::{Receiver, Sender, channel};
+use futures::channel::mpsc::{Receiver, SendError, Sender, channel};
 use futures::future::{MaybeDone, maybe_done};
 use futures::{SinkExt, Stream, StreamExt, join};
 use join_me_maybe::join_me_maybe;
@@ -28,6 +28,61 @@ impl<T> RendezvousSender<T> {
             .send(item)
             .await
             .expect("receiver should not drop");
+    }
+
+    fn wait_for_space(&mut self) -> impl Future<Output = ()> {
+        std::future::poll_fn(|cx| match self.sender.poll_ready(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(()),
+            Poll::Ready(Err(_)) => {
+                panic!("this channel should never close");
+            }
+            Poll::Pending => Poll::Pending,
+        })
+    }
+}
+
+// THIS THING SHOULD OWN THE *INPUT* (not the output) AND CALL YOUR CLOSURE FOR YOU AS IT READS
+// INPUTS. YOU ALWAYS WANT TO DO THAT (but you don't always want to send, e.g. for filtering) IT
+// SHOULD SUPPORT ORDERED AND UNORDERED READS
+struct ConcurrentReaderExecutor<T, U, F, Fut>
+where
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = U>,
+{
+    inputs: Receiver<T>,
+    closure: F,
+    concurrent_futures: VecDeque<Pin<Box<MaybeDone<Fut>>>>,
+    limit: usize,
+}
+
+fn concurrent_reader_executor<T, U, F, Fut>(
+    inputs: Receiver<T>,
+    limit: usize,
+    f: F,
+) -> ConcurrentReaderExecutor<T, U, F, Fut>
+where
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = U>,
+{
+    ConcurrentReaderExecutor {
+        inputs,
+        closure: f,
+        concurrent_futures: VecDeque::new(),
+        limit,
+    }
+}
+
+impl<T, U, F, Fut> ConcurrentReaderExecutor<T, U, F, Fut>
+where
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = U>,
+{
+    /// Continue reading input (as long as there's capacity) and polling futures, without taking
+    /// the output of any future yet.
+    fn make_progress(&mut self) -> impl Future<Output = U> {
+        std::future::poll_fn(|cx| {
+            todo!();
+        })
     }
 }
 
@@ -152,9 +207,48 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
                 join! {
                     self.future,
                     async {
-                        let mut futures = ConcurrentFutures::new();
-                        let mut inputs = self.outputs.fuse();
+                        let mut inputs = self.outputs;
+                        let mut futures_ordered = FuturesOrdered::new();
+                        let mut outputs = VecDeque::new();
                         loop {
+                            let buffered_futures = futures_ordered.len();
+                            let buffered_outputs = outputs.len();
+                            let buffered = futures_ordered.len() + outputs.len();
+                            assert!(buffered <= limit);
+                            let at_capacity = buffered == limit;
+                            // All three arms of this join need to be cancel-safe.
+                            let (maybe_input, _, _) = join_me_maybe!(
+                                // Cancel safety: the input is returned immediately without another
+                                // await.
+                                await_input: async {
+                                    // If we're not at capacity, try to read another input.
+                                    if !at_capacity && let Some(input) = inputs.next().await {
+                                        // Once we get an input, cancel the output wait, so that we
+                                        // can add this input to `futures_ordered`.
+                                        await_output_space.cancel();
+                                        Some(input)
+                                    } else {
+                                        None
+                                    }
+                                },
+                                await_output_space: {
+                                    // If we have any 
+                                    sender.wait_for_space().await;
+                                // Cancel safety: the input is returned immediately without another
+                                // await.
+                                maybe async {
+                                    // Meanwhile, keep making forward progress on buffered futures.
+                                    while let Some(output) = futures_ordered.next().await {
+                                        outputs.push_back(output);
+                                    }
+                                },
+                            );
+
+
+
+
+
+
                             let futures_len = futures.len();
                             let (maybe_input, _) = join_me_maybe!(
                                 await_input: async {
