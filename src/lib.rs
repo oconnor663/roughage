@@ -126,11 +126,11 @@ async fn with_context_nonblocking<T>(f: impl FnOnce(&mut Context) -> T) -> T {
     .await
 }
 
-// This is clearly an `async fn` that wishes it was a `Future` impl. It has to be that way to
-// compile on stable today, becasue there's no way to refer to the future that an `AsyncFnMut`
-// returns, so we can't put it in a struct type (that also owns the closure and needs to be able to
-// express the relationship), and we can't put a `Send` bound on it either (so we can't box it up
-// in a way that's compatible with e.g. Tokio).
+// This is clearly an `async fn` that wishes it was a `Future` impl. It has to be this way to
+// compile on stable today, because there's no way to refer to the future that an
+// `AsyncFn`/`AsyncFnMut` returns, so we can't put it in a struct type (that also owns the closure
+// and needs to be able to express the relationship), and we can't put a `Send` bound on it either
+// (so we can't box it up in a way that's compatible with e.g. Tokio).
 async fn concurrent_pipe_executor<T, U>(
     inner_executor_type: InnerExecutorType,
     mut inputs: Receiver<T>,
@@ -138,13 +138,21 @@ async fn concurrent_pipe_executor<T, U>(
     mut outputs: Sender<U>,
 ) {
     let mut inner_executor = new_inner_executor(inner_executor_type);
+
     // If the input channel is closed, and the inner executor is empty (of both futures and
     // outputs), then we're done. Note that here we don't consider whether there's an output in
     // flight; that's handled by the outputs channel.
     while !inputs.is_terminated() || inner_executor.len() > 0 {
+        // The input, output, and poll_progress tasks can all unblock each other, so we might need
+        // to run this loop more than once before yielding `pending!()`. We'll only yield if *none*
+        // of them made progress.
+        let mut loop_again_before_yielding = false;
+
         // If an output is ready, and there's space in the outputs channel, send one.
         let mut output_in_flight = 0;
+        let mut attempted_to_send_output = false;
         if inner_executor.has_output() {
+            attempted_to_send_output = true;
             let outputs_ready = with_context_nonblocking(|cx| outputs.poll_ready(cx)).await;
             match outputs_ready {
                 Pending => output_in_flight = 1, // A wakeup is scheduled for this.
@@ -152,6 +160,7 @@ async fn concurrent_pipe_executor<T, U>(
                 Ready(Ok(())) => {
                     let output = inner_executor.pop_output().unwrap();
                     outputs.start_send(output).unwrap();
+                    loop_again_before_yielding = true;
                 }
             }
         }
@@ -167,14 +176,23 @@ async fn concurrent_pipe_executor<T, U>(
                 Ready(Some(input)) => {
                     let future = (filter_map)(input);
                     inner_executor.push(future);
+                    loop_again_before_yielding = true;
                 }
             }
         }
 
-        // Drive any buffered futures, potentially including one we just received.
+        // Drive any buffered futures, potentially including one we just received. This might make
+        // progress internally, but the only way it could unblock the other tasks is by giving us
+        // some output to send when we didn't have any before.
         with_context_nonblocking(|cx| inner_executor.poll_progress(cx)).await;
+        if !attempted_to_send_output && inner_executor.has_output() {
+            loop_again_before_yielding = true;
+        }
 
-        // TODO: At some point we have to yield!?
+        if !loop_again_before_yielding {
+            // We've made as much progress as we can and scheduled all the relevant wakeups.
+            futures::pending!();
+        }
     }
 }
 
