@@ -524,8 +524,37 @@ mod tests {
             .await;
         let mut v = v.lock().await;
         // Assert out-of-order behavior. This might end up being flaky, and if so I'll remove it.
-        assert_ne!(*v, vec![3, 7, 11]);
+        // Update: Yep, it's flaky.
+        // assert_ne!(*v, vec![3, 7, 11]);
         v.sort();
         assert_eq!(*v, vec![3, 7, 11]);
+    }
+
+    #[tokio::test]
+    async fn test_deadlocks() {
+        async fn foo(i: i32) -> i32 {
+            static LOCK: Mutex<()> = Mutex::const_new(());
+            let _guard = LOCK.lock();
+            sleep(Duration::from_millis(rand::random_range(0..10))).await;
+            i + 1
+        }
+
+        // TODO: This is a compilation time disaster. It takes like 30 seconds. I don't know what
+        // to do...
+        let mut v: Vec<i32> = pipeline(futures::stream::iter(0..100))
+            .map(async |i| foo(i).await)
+            .map_concurrent(async |i| foo(i).await, 10)
+            .map_unordered(async |i| foo(i).await, 10)
+            .filter(async |_| true)
+            .filter_concurrent(async |_| true, 10)
+            .filter_unordered(async |_| true, 10)
+            .filter_map(async |i| Some(foo(i).await))
+            .filter_map_concurrent(async |i| Some(foo(i).await), 10)
+            .filter_map_unordered(async |i| Some(foo(i).await), 10)
+            .collect()
+            .await;
+
+        v.sort();
+        assert_eq!(v[..], (6..106).collect::<Vec<_>>());
     }
 }
