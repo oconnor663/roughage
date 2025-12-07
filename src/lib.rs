@@ -215,7 +215,7 @@ pub struct AsyncPipeline<Fut: Future, T> {
 }
 
 impl<Fut: Future, T> AsyncPipeline<Fut, T> {
-    pub fn then<F, U>(mut self, mut f: F) -> AsyncPipeline<impl Future, U>
+    pub fn map<F, U>(mut self, mut f: F) -> AsyncPipeline<impl Future, U>
     where
         F: AsyncFnMut(T) -> U,
     {
@@ -231,7 +231,7 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         }
     }
 
-    pub fn then_concurrent<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
+    pub fn map_concurrent<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
     where
         F: AsyncFn(T) -> U,
     {
@@ -250,11 +250,7 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         }
     }
 
-    pub fn then_concurrent_unordered<F, U>(
-        self,
-        f: F,
-        limit: usize,
-    ) -> AsyncPipeline<impl Future, U>
+    pub fn map_concurrent_unordered<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
     where
         F: AsyncFn(T) -> U,
     {
@@ -298,6 +294,20 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         .await;
     }
 
+    pub async fn for_each_concurrent<F>(self, f: F, limit: usize)
+    where
+        F: AsyncFn(T),
+    {
+        self.map_concurrent_unordered(
+            async move |input| {
+                f(input).await;
+            },
+            limit,
+        )
+        .for_each(async |_| {})
+        .await;
+    }
+
     pub async fn collect<C: Default + Extend<T>>(mut self) -> C {
         join(self.future, async move {
             let mut collection = C::default();
@@ -320,11 +330,11 @@ mod tests {
     async fn test_for_each() {
         let mut v = Vec::new();
         pipeline(futures::stream::iter(0..5))
-            .then(async |x| {
+            .map(async |x| {
                 sleep(Duration::from_millis(1)).await;
                 x + 1
             })
-            .then(async |x| {
+            .map(async |x| {
                 sleep(Duration::from_millis(1)).await;
                 10 * x
             })
@@ -338,11 +348,11 @@ mod tests {
     #[tokio::test]
     async fn test_collect() {
         let v: Vec<_> = pipeline(futures::stream::iter(0..5))
-            .then(async |x| {
+            .map(async |x| {
                 sleep(Duration::from_millis(1)).await;
                 x + 1
             })
-            .then(async |x| {
+            .map(async |x| {
                 sleep(Duration::from_millis(1)).await;
                 10 * x
             })
@@ -409,7 +419,7 @@ mod tests {
         static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         let v: Vec<i32> = pipeline(futures::stream::iter(0..10))
-            .then_concurrent(
+            .map_concurrent(
                 async |i| {
                     let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
                     MAX_IN_FLIGHT.fetch_max(in_flight + 1, Relaxed);
@@ -430,7 +440,7 @@ mod tests {
         static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         let v: Vec<i32> = pipeline(futures::stream::iter(0..10))
-            .then_concurrent_unordered(
+            .map_concurrent_unordered(
                 async |i| {
                     let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
                     MAX_IN_FLIGHT.fetch_max(in_flight + 1, Relaxed);
