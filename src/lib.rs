@@ -269,6 +269,61 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         }
     }
 
+    pub fn filter<F>(mut self, mut f: F) -> AsyncPipeline<impl Future, T>
+    where
+        F: AsyncFnMut(&T) -> bool,
+    {
+        let (mut sender, receiver) = channel(0);
+        AsyncPipeline {
+            future: join(self.future, async move {
+                while let Some(input) = self.outputs.next().await {
+                    if f(&input).await {
+                        sender.send(input).await.expect("channel should not close");
+                    }
+                }
+            }),
+            outputs: receiver,
+        }
+    }
+
+    pub fn filter_concurrent<F>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, T>
+    where
+        F: AsyncFn(&T) -> bool,
+    {
+        let (sender, receiver) = channel(0);
+        AsyncPipeline {
+            future: join(
+                self.future,
+                concurrent_pipe_executor(
+                    InnerExecutorType::Ordered { limit },
+                    self.outputs,
+                    async move |t| f(&t).await.then_some(t),
+                    sender,
+                ),
+            ),
+            outputs: receiver,
+        }
+    }
+
+    pub fn filter_unordered<F>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, T>
+    where
+        F: AsyncFn(&T) -> bool,
+    {
+        let (sender, receiver) = channel(0);
+        AsyncPipeline {
+            future: join(
+                self.future,
+                concurrent_pipe_executor(
+                    InnerExecutorType::Unordered { limit },
+                    self.outputs,
+                    async move |t| f(&t).await.then_some(t),
+                    sender,
+                ),
+            ),
+            outputs: receiver,
+        }
+    }
+
     pub fn buffered(mut self, buf_size: usize) -> AsyncPipeline<impl Future, T> {
         assert!(buf_size > 0, "`buf_size` must be at least 1");
         let (mut sender, receiver) = channel(buf_size);
@@ -324,6 +379,7 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Mutex;
     use tokio::time::{Duration, sleep};
 
     #[tokio::test]
@@ -453,5 +509,33 @@ mod tests {
             .collect()
             .await;
         assert_eq!(v, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
+    }
+
+    #[tokio::test]
+    async fn test_filter() {
+        let v = Mutex::new(Vec::new());
+        pipeline(futures::stream::iter(0..12))
+            .filter(async |x| x % 4 != 0)
+            .filter_concurrent(async |x| x % 4 != 1, 3)
+            .filter_unordered(
+                async |x| {
+                    // Provoke out-of-order behavior.
+                    sleep(Duration::from_millis(12 - x)).await;
+                    x % 4 != 2
+                },
+                3,
+            )
+            .for_each_concurrent(
+                async |x| {
+                    v.lock().await.push(x);
+                },
+                3,
+            )
+            .await;
+        let mut v = v.lock().await;
+        // Assert out-of-order behavior. This might end up being flaky, and if so I'll remove it.
+        assert_ne!(*v, vec![3, 7, 11]);
+        v.sort();
+        assert_eq!(*v, vec![3, 7, 11]);
     }
 }
