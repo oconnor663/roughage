@@ -1,7 +1,7 @@
 use futures::channel::mpsc::{Receiver, Sender, channel};
-use futures::future::MaybeDone;
+use futures::future::join;
 use futures::stream::{FusedStream, FuturesOrdered, FuturesUnordered};
-use futures::{SinkExt, Stream, StreamExt, join};
+use futures::{SinkExt, Stream, StreamExt};
 use std::collections::VecDeque;
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll, Poll::Pending, Poll::Ready};
@@ -173,51 +173,8 @@ async fn concurrent_pipe_executor<T, U>(
 
         // Drive any buffered futures, potentially including one we just received.
         with_context_nonblocking(|cx| inner_executor.poll_progress(cx)).await;
-    }
-}
 
-// as above
-async fn serial_pipe_executor<T, U>(
-    mut inputs: Receiver<T>,
-    filter_map: impl AsyncFnMut(T) -> Option<U>,
-    mut outputs: Sender<U>,
-) {
-    let mut maybe_future = pin!(MaybeDone::Gone);
-
-    loop {
-        // If an output is ready, and there's space in the outputs channel, send one.
-        let mut output_in_flight = false;
-        if let MaybeDone::Done(Some(output)) = *maybe_future {
-            let outputs_ready = with_context_nonblocking(|cx| outputs.poll_ready(cx)).await;
-            match outputs_ready {
-                Pending => output_in_flight = true, // A wakeup is scheduled for this.
-                Ready(Err(_)) => panic!("outputs channel should not be closed"),
-                Ready(Ok(())) => {
-                    let output = maybe_future.take_output().unwrap().unwrap();
-                    outputs.start_send(output).unwrap();
-                }
-            }
-        }
-
-        // If there's capacity in the inner executor (even counting the output in flight, if any)
-        // try to receive an input.
-        if !matches!(*maybe_future, MaybeDone::Future(_)) && !output_in_flight {
-            let next_input =
-                with_context_nonblocking(|cx| Pin::new(&mut inputs).poll_next(cx)).await;
-            match next_input {
-                Pending => {}     // A wakeup is scheduled for this.
-                Ready(None) => {} // The channel is closed.
-                Ready(Some(input)) => {
-                    let future = (filter_map)(input);
-                    maybe_future.set(MaybeDone::Future(future));
-                }
-            }
-        }
-
-        // If there's a buffered future (possibly one we just received), drive it.
-        if matches!(*maybe_future, MaybeDone::Future(_)) {
-            with_context_nonblocking(|cx| maybe_future.poll(cx)).await;
-        }
+        // TODO: At some point we have to yield!?
     }
 }
 
@@ -227,7 +184,7 @@ pub fn pipeline<S: Stream>(stream: S) -> AsyncPipeline<impl Future, S::Item> {
         future: async move {
             let mut stream = pin!(stream);
             while let Some(item) = stream.next().await {
-                sender.send(item).await;
+                sender.send(item).await.expect("channel should not close");
             }
         },
         outputs: receiver,
@@ -240,13 +197,18 @@ pub struct AsyncPipeline<Fut: Future, T> {
 }
 
 impl<Fut: Future, T> AsyncPipeline<Fut, T> {
-    pub fn then<F, U>(self, mut f: F) -> AsyncPipeline<impl Future, U>
+    pub fn then<F, U>(mut self, mut f: F) -> AsyncPipeline<impl Future, U>
     where
         F: AsyncFnMut(T) -> U,
     {
-        let (sender, receiver) = channel(0);
+        let (mut sender, receiver) = channel(0);
         AsyncPipeline {
-            future: serial_pipe_executor(self.outputs, async move |t| Some(f(t).await), sender),
+            future: join(self.future, async move {
+                while let Some(input) = self.outputs.next().await {
+                    let output = f(input).await;
+                    sender.send(output).await.expect("channel should not close");
+                }
+            }),
             outputs: receiver,
         }
     }
@@ -257,11 +219,37 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
     {
         let (sender, receiver) = channel(0);
         AsyncPipeline {
-            future: concurrent_pipe_executor(
-                InnerExecutorType::Ordered { limit },
-                self.outputs,
-                async move |t| Some(f(t).await),
-                sender,
+            future: join(
+                self.future,
+                concurrent_pipe_executor(
+                    InnerExecutorType::Ordered { limit },
+                    self.outputs,
+                    async move |t| Some(f(t).await),
+                    sender,
+                ),
+            ),
+            outputs: receiver,
+        }
+    }
+
+    pub fn then_concurrent_unordered<F, U>(
+        self,
+        f: F,
+        limit: usize,
+    ) -> AsyncPipeline<impl Future, U>
+    where
+        F: AsyncFn(T) -> U,
+    {
+        let (sender, receiver) = channel(0);
+        AsyncPipeline {
+            future: join(
+                self.future,
+                concurrent_pipe_executor(
+                    InnerExecutorType::Unordered { limit },
+                    self.outputs,
+                    async move |t| Some(f(t).await),
+                    sender,
+                ),
             ),
             outputs: receiver,
         }
@@ -271,16 +259,11 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         assert!(buf_size > 0, "`buf_size` must be at least 1");
         let (mut sender, receiver) = channel(buf_size);
         AsyncPipeline {
-            future: async {
-                join! {
-                    self.future,
-                    async move {
-                        while let Some(input) = self.outputs.next().await {
-                            sender.send(input).await.expect("receiver should not drop");
-                        }
-                    }
-                };
-            },
+            future: join(self.future, async move {
+                while let Some(input) = self.outputs.next().await {
+                    sender.send(input).await.expect("channel should not close");
+                }
+            }),
             outputs: receiver,
         }
     }
@@ -289,27 +272,23 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
     where
         F: AsyncFnMut(T),
     {
-        join! {
-            self.future,
-            async move {
-                while let Some(input) = self.outputs.next().await {
-                    f(input).await;
-                }
+        join(self.future, async move {
+            while let Some(input) = self.outputs.next().await {
+                f(input).await;
             }
-        };
+        })
+        .await;
     }
 
     pub async fn collect<C: Default + Extend<T>>(mut self) -> C {
-        join! {
-            self.future,
-            async move {
-                let mut collection = C::default();
-                while let Some(input) = self.outputs.next().await {
-                    collection.extend(std::iter::once(input));
-                }
-                collection
+        join(self.future, async move {
+            let mut collection = C::default();
+            while let Some(input) = self.outputs.next().await {
+                collection.extend(std::iter::once(input));
             }
-        }
+            collection
+        })
+        .await
         .1
     }
 }
@@ -406,24 +385,45 @@ mod tests {
         .await;
     }
 
-    // #[tokio::test]
-    // async fn test_concurrent() {
-    //     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-    //     static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
-    //     static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
-    //     let v: Vec<i32> = pipeline(futures::stream::iter(0..10))
-    //         .then_concurrent(
-    //             async |i| {
-    //                 let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
-    //                 MAX_IN_FLIGHT.fetch_max(in_flight + 1, Relaxed);
-    //                 sleep(Duration::from_millis(1)).await;
-    //                 FUTURES_IN_FLIGHT.fetch_sub(1, Relaxed);
-    //                 2 * i
-    //             },
-    //             3,
-    //         )
-    //         .collect()
-    //         .await;
-    //     assert_eq!(v, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
-    // }
+    #[tokio::test]
+    async fn test_concurrent() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+        static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+        let v: Vec<i32> = pipeline(futures::stream::iter(0..10))
+            .then_concurrent(
+                async |i| {
+                    let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
+                    MAX_IN_FLIGHT.fetch_max(in_flight + 1, Relaxed);
+                    sleep(Duration::from_millis(1)).await;
+                    FUTURES_IN_FLIGHT.fetch_sub(1, Relaxed);
+                    2 * i
+                },
+                3,
+            )
+            .collect()
+            .await;
+        assert_eq!(v, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_unordered() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+        static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+        let v: Vec<i32> = pipeline(futures::stream::iter(0..10))
+            .then_concurrent_unordered(
+                async |i| {
+                    let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
+                    MAX_IN_FLIGHT.fetch_max(in_flight + 1, Relaxed);
+                    sleep(Duration::from_millis(1)).await;
+                    FUTURES_IN_FLIGHT.fetch_sub(1, Relaxed);
+                    2 * i
+                },
+                3,
+            )
+            .collect()
+            .await;
+        assert_eq!(v, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
+    }
 }
