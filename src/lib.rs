@@ -215,70 +215,58 @@ pub struct AsyncPipeline<Fut: Future, T> {
 }
 
 impl<Fut: Future, T> AsyncPipeline<Fut, T> {
-    pub fn map<F, U>(mut self, mut f: F) -> AsyncPipeline<impl Future, U>
+    pub fn map<F, U>(self, mut f: F) -> AsyncPipeline<impl Future, U>
     where
         F: AsyncFnMut(T) -> U,
     {
-        let (mut sender, receiver) = channel(0);
-        AsyncPipeline {
-            future: join(self.future, async move {
-                while let Some(input) = self.outputs.next().await {
-                    let output = f(input).await;
-                    sender.send(output).await.expect("channel should not close");
-                }
-            }),
-            outputs: receiver,
-        }
+        self.filter_map(async move |t| Some(f(t).await))
     }
 
     pub fn map_concurrent<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
     where
         F: AsyncFn(T) -> U,
     {
-        let (sender, receiver) = channel(0);
-        AsyncPipeline {
-            future: join(
-                self.future,
-                concurrent_pipe_executor(
-                    InnerExecutorType::Ordered { limit },
-                    self.outputs,
-                    async move |t| Some(f(t).await),
-                    sender,
-                ),
-            ),
-            outputs: receiver,
-        }
+        self.filter_map_concurrent(async move |t| Some(f(t).await), limit)
     }
 
-    pub fn map_concurrent_unordered<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
+    pub fn map_unordered<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
     where
         F: AsyncFn(T) -> U,
     {
-        let (sender, receiver) = channel(0);
-        AsyncPipeline {
-            future: join(
-                self.future,
-                concurrent_pipe_executor(
-                    InnerExecutorType::Unordered { limit },
-                    self.outputs,
-                    async move |t| Some(f(t).await),
-                    sender,
-                ),
-            ),
-            outputs: receiver,
-        }
+        self.filter_map_unordered(async move |t| Some(f(t).await), limit)
     }
 
-    pub fn filter<F>(mut self, mut f: F) -> AsyncPipeline<impl Future, T>
+    pub fn filter<F>(self, mut f: F) -> AsyncPipeline<impl Future, T>
     where
         F: AsyncFnMut(&T) -> bool,
+    {
+        self.filter_map(async move |t| f(&t).await.then_some(t))
+    }
+
+    pub fn filter_concurrent<F>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, T>
+    where
+        F: AsyncFn(&T) -> bool,
+    {
+        self.filter_map_concurrent(async move |t| f(&t).await.then_some(t), limit)
+    }
+
+    pub fn filter_unordered<F>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, T>
+    where
+        F: AsyncFn(&T) -> bool,
+    {
+        self.filter_map_unordered(async move |t| f(&t).await.then_some(t), limit)
+    }
+
+    pub fn filter_map<F, U>(mut self, mut f: F) -> AsyncPipeline<impl Future, U>
+    where
+        F: AsyncFnMut(T) -> Option<U>,
     {
         let (mut sender, receiver) = channel(0);
         AsyncPipeline {
             future: join(self.future, async move {
                 while let Some(input) = self.outputs.next().await {
-                    if f(&input).await {
-                        sender.send(input).await.expect("channel should not close");
+                    if let Some(output) = f(input).await {
+                        sender.send(output).await.expect("channel should not close");
                     }
                 }
             }),
@@ -286,9 +274,9 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         }
     }
 
-    pub fn filter_concurrent<F>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, T>
+    pub fn filter_map_concurrent<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
     where
-        F: AsyncFn(&T) -> bool,
+        F: AsyncFn(T) -> Option<U>,
     {
         let (sender, receiver) = channel(0);
         AsyncPipeline {
@@ -297,7 +285,7 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
                 concurrent_pipe_executor(
                     InnerExecutorType::Ordered { limit },
                     self.outputs,
-                    async move |t| f(&t).await.then_some(t),
+                    async move |t| f(t).await,
                     sender,
                 ),
             ),
@@ -305,9 +293,9 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         }
     }
 
-    pub fn filter_unordered<F>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, T>
+    pub fn filter_map_unordered<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
     where
-        F: AsyncFn(&T) -> bool,
+        F: AsyncFn(T) -> Option<U>,
     {
         let (sender, receiver) = channel(0);
         AsyncPipeline {
@@ -316,7 +304,7 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
                 concurrent_pipe_executor(
                     InnerExecutorType::Unordered { limit },
                     self.outputs,
-                    async move |t| f(&t).await.then_some(t),
+                    async move |t| f(t).await,
                     sender,
                 ),
             ),
@@ -324,6 +312,8 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         }
     }
 
+    /// By default a single element is buffered in between each pipeline stage. This adds a
+    /// pipeline state that buffers extra elements.
     pub fn buffered(mut self, buf_size: usize) -> AsyncPipeline<impl Future, T> {
         assert!(buf_size > 0, "`buf_size` must be at least 1");
         let (mut sender, receiver) = channel(buf_size);
@@ -353,7 +343,7 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
     where
         F: AsyncFn(T),
     {
-        self.map_concurrent_unordered(
+        self.map_unordered(
             async move |input| {
                 f(input).await;
             },
@@ -496,7 +486,7 @@ mod tests {
         static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         let v: Vec<i32> = pipeline(futures::stream::iter(0..10))
-            .map_concurrent_unordered(
+            .map_unordered(
                 async |i| {
                     let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
                     MAX_IN_FLIGHT.fetch_max(in_flight + 1, Relaxed);
