@@ -65,7 +65,6 @@
 //! it never stops polling it:
 //!
 //! ```rust
-//! # use async_pipeline::AsyncPipeline;
 //! # use tokio::sync::Mutex;
 //! # use tokio::time::{Duration, sleep};
 //! # static LOCK: Mutex<()> = Mutex::const_new(());
@@ -75,7 +74,9 @@
 //! # }
 //! # #[tokio::main]
 //! # async fn main() {
-//! AsyncPipeline::new(futures::stream::iter(0..100))
+//! use async_pipeline::AsyncPipeline;
+//!
+//! AsyncPipeline::from_iter(0..100)
 //!     .map_concurrent(|_| foo(), 10)
 //!     .map_unordered(|_| foo(), 10)
 //!     .for_each_concurrent(|_| foo(), 10)
@@ -360,8 +361,14 @@ pub struct AsyncPipeline<'a, S: Stream + 'a> {
     stages: Vec<Pin<Box<dyn TypeErasedStage + 'a>>>,
 }
 
+impl<'a, I: Iterator> AsyncPipeline<'a, futures::stream::Iter<I>> {
+    pub fn from_iter(iter: impl IntoIterator<IntoIter = I>) -> Self {
+        Self::from_stream(futures::stream::iter(iter))
+    }
+}
+
 impl<'a, S: Stream> AsyncPipeline<'a, S> {
-    pub fn new(stream: S) -> Self {
+    pub fn from_stream(stream: S) -> Self {
         Self {
             outputs: stream,
             stages: Vec::new(),
@@ -524,6 +531,7 @@ impl<'a, S: Stream> AsyncPipeline<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
     use tokio::sync::Mutex;
     use tokio::time::{Duration, sleep};
 
@@ -532,7 +540,7 @@ mod tests {
         let inputs = [0, 1, 2, 3, 4];
         let mut v = Vec::new();
         // Iterate over references, to make sure we can.
-        AsyncPipeline::new(futures::stream::iter(inputs.iter()))
+        AsyncPipeline::from_iter(&inputs)
             .adapt_output_stream(|s| {
                 s.then(async |x| {
                     sleep(Duration::from_millis(1)).await;
@@ -556,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn test_for_each_concurrent() {
         let v = Mutex::new(Vec::new());
-        AsyncPipeline::new(futures::stream::iter(0..5))
+        AsyncPipeline::from_iter(0..5)
             .adapt_output_stream(|s| {
                 s.then(async |x| {
                     sleep(Duration::from_millis(1)).await;
@@ -582,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect() {
-        let v: Vec<_> = AsyncPipeline::new(futures::stream::iter(0..5))
+        let v: Vec<_> = AsyncPipeline::from_iter(0..5)
             .adapt_output_stream(|s| {
                 s.then(async |x| {
                     sleep(Duration::from_millis(1)).await;
@@ -600,10 +608,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_in_flight() {
-        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         static ELEMENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         let mut i = 0;
-        AsyncPipeline::new(futures::stream::iter(std::iter::from_fn(|| {
+        AsyncPipeline::from_iter(std::iter::from_fn(|| {
             if i < 10 {
                 let in_flight = ELEMENTS_IN_FLIGHT.fetch_add(1, Relaxed);
                 assert_eq!(in_flight, 0, "too many elements in flight at i = {i}");
@@ -612,7 +619,7 @@ mod tests {
             } else {
                 None
             }
-        })))
+        }))
         .for_each(async |i| {
             let in_flight = ELEMENTS_IN_FLIGHT.fetch_sub(1, Relaxed);
             assert_eq!(in_flight, 1, "too many elements in flight at i = {i}");
@@ -626,7 +633,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
-        let v: Vec<i32> = AsyncPipeline::new(futures::stream::iter(0..10))
+        let v: Vec<i32> = AsyncPipeline::from_iter(0..10)
             .map_concurrent(
                 async |i| {
                     let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
@@ -648,7 +655,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
-        let v: Vec<i32> = AsyncPipeline::new(futures::stream::iter(0..10))
+        let v: Vec<i32> = AsyncPipeline::from_iter(0..10)
             .map_unordered(
                 async |i| {
                     let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
@@ -678,7 +685,7 @@ mod tests {
         }
 
         let v = Mutex::new(Vec::new());
-        AsyncPipeline::new(futures::stream::iter(0..100))
+        AsyncPipeline::from_iter(0..100)
             .map_concurrent(async |i| foo(i).await, 10)
             .map_unordered(async |i| foo(i).await, 10)
             .filter_map_concurrent(async |i| Some(foo(i).await), 10)
