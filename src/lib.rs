@@ -1,30 +1,35 @@
-//! This crate is a replacement for [`buffered`] streams, [`FuturesOrdered`], and
-//! [`FuturesUnordered`], which are broken if any future in the buffer touches any async lock
-//! ([`Mutex`], [`RwLock`], [`Semaphore`], etc.), even indirectly through abstractions like
-//! [`tokio::sync::mpsc`] channels (which [use a `Semaphore` internally][internally]).
+//! This crate provides a single type, `AsyncPipeline`, which is an alternative to [`buffered`]
+//! streams, [`FuturesOrdered`], and [`FuturesUnordered`].
+//!
+//! All of those are prone to deadlocks if any of their buffered/concurrent futures touches an
+//! async lock of any kind, _even indirectly_. (For example, note that [`tokio::sync::mpsc`]
+//! channels [use a `Semaphore` internally][internally].) The problem is that they don't
+//! consistently poll their buffered futures, so a future holding a lock could stop making forward
+//! progress through no fault of its own. `AsyncPipeline` fixes this whole class of deadlocks by
+//! consistently polling all its in-flight futures until they complete. In other words,
+//! `AsyncPipeline` will never "snooze" a future.
 //!
 //! [`buffered`]: https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffered
 //! [`FuturesOrdered`]: https://docs.rs/futures/latest/futures/stream/struct.FuturesOrdered.html
 //! [`FuturesUnordered`]: https://docs.rs/futures/latest/futures/stream/struct.FuturesUnordered.html
-//! [`Mutex`]: https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html
-//! [`RwLock`]: https://docs.rs/tokio/latest/tokio/sync/struct.RwLock.html
-//! [`Semaphore`]: https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html
 //! [`tokio::sync::mpsc`]: https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html
 //! [internally]: https://github.com/tokio-rs/tokio/blob/0ec0a8546105b9f250f868b77e42c82809703aab/tokio/src/sync/mpsc/bounded.rs#L162
 //!
 //! Here's how easy it is to provoke a deadlock with `buffered` streams:
 //!
 //! ```rust,no_run
-//! # use futures::StreamExt;
-//! # use futures::stream::{FuturesOrdered, FuturesUnordered};
-//! # use tokio::sync::Mutex;
-//! # use tokio::time::{Duration, sleep};
+//! use futures::StreamExt;
+//! use tokio::sync::Mutex;
+//! use tokio::time::{Duration, sleep};
+//!
 //! static LOCK: Mutex<()> = Mutex::const_new(());
 //!
-//! // An example function that touches a lock. No tricks here!
+//! // An innocent example function that touches an async lock. Note that the deadlocks below can
+//! // happen even if this function is buried three crates deep in some dependency you never see.
 //! async fn foo() {
 //!     let _guard = LOCK.lock().await;
 //!     sleep(Duration::from_millis(1)).await;
+//!     // It *looks like* `foo` is guaranteed to release this lock after 1 ms...
 //! }
 //!
 //! # #[tokio::main]
@@ -32,7 +37,7 @@
 //! futures::stream::iter([foo(), foo()])
 //!     .buffered(2)
 //!     .for_each(|_| async {
-//!         foo().await; // deadlock!
+//!         foo().await; // Deadlock!
 //!     })
 //!     .await;
 //! # }
@@ -42,7 +47,6 @@
 //!
 //! ```rust,no_run
 //! # use futures::StreamExt;
-//! # use futures::stream::{FuturesOrdered, FuturesUnordered};
 //! # use tokio::sync::Mutex;
 //! # use tokio::time::{Duration, sleep};
 //! # static LOCK: Mutex<()> = Mutex::const_new(());
@@ -52,11 +56,11 @@
 //! # }
 //! # #[tokio::main]
 //! # async fn main() {
-//! let mut unordered = FuturesUnordered::new();
+//! let mut unordered = futures::stream::FuturesUnordered::new();
 //! unordered.push(foo());
 //! unordered.push(foo());
 //! while let Some(_) = unordered.next().await {
-//!     foo().await; // deadlock!
+//!     foo().await; // Deadlock!
 //! }
 //! # }
 //! ```
@@ -74,7 +78,7 @@
 //! # }
 //! # #[tokio::main]
 //! # async fn main() {
-//! use async_pipeline::AsyncPipeline;
+//! use roughage::AsyncPipeline;
 //!
 //! AsyncPipeline::from_iter(0..100)
 //!     .map_concurrent(|_| foo(), 10)
@@ -84,6 +88,9 @@
 //! // Deadlock free!
 //! # }
 //! ```
+//!
+//! "Roughage" (_ruff_-_edge_) is an older term for dietary fiber. It keeps our pipes running
+//! smoothly.
 
 use atomic_refcell::AtomicRefCell;
 use futures::future::{Fuse, FusedFuture, join};
@@ -356,6 +363,11 @@ where
     })
 }
 
+/// Like a [`buffered`] stream, with the added guarantee that it won't "snooze" futures.
+///
+/// See the [crate-level documentation](crate) for an example.
+///
+/// [`buffered`]: https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffered
 pub struct AsyncPipeline<'a, S: Stream + 'a> {
     outputs: S,
     stages: Vec<Pin<Box<dyn TypeErasedStage + 'a>>>,
