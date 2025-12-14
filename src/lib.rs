@@ -533,7 +533,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
     use tokio::sync::Mutex;
+    use tokio::sync::mpsc::unbounded_channel;
     use tokio::time::{Duration, sleep};
+    use tokio_stream::wrappers::UnboundedReceiverStream;
 
     #[tokio::test]
     async fn test_for_each() {
@@ -702,5 +704,52 @@ mod tests {
         let mut v = v.into_inner();
         v.sort();
         assert_eq!(v[..], (5..105).collect::<Vec<_>>());
+    }
+
+    /// The stream that the pipeline starts with can be a channel. This lets you "spawn" jobs into
+    /// the pipeline, kind of like you would with a `FuturesUnordered`.
+    #[tokio::test]
+    async fn test_channel() {
+        let lock = Mutex::new(());
+        let atomic1 = AtomicU32::new(0);
+        let atomic2 = AtomicU32::new(0);
+        let num_jobs: usize = 1000;
+        let (sender, receiver) = unbounded_channel::<()>();
+        let pipeline = AsyncPipeline::from_stream(UnboundedReceiverStream::new(receiver))
+            .for_each_concurrent(
+                async |_| {
+                    atomic1.fetch_add(1, Relaxed);
+                    let _guard = lock.lock().await;
+                    atomic2.fetch_add(1, Relaxed);
+                },
+                num_jobs,
+            );
+        join(pipeline, async {
+            // Take the lock.
+            let _guard = lock.lock().await;
+            // Spawn a bunch of tasks in the pipeline. They will each increment `atomic1` and then
+            // block on the lock.
+            for _ in 0..num_jobs {
+                sender.send(()).unwrap();
+            }
+            // Wait for `atomic1` to reach `num_jobs`. We do need to yield to let the pipeline make
+            // progress.
+            while atomic1.load(Relaxed) != num_jobs as u32 {
+                sleep(Duration::from_millis(1)).await;
+            }
+            // At this point, none of the jobs have gotten to `atomic2`. It should still be zero.
+            assert_eq!(atomic2.load(Relaxed), 0);
+            // Unblock them.
+            drop(_guard);
+            // Wait for `atomic2` to reach `num_jobs` also.
+            while atomic2.load(Relaxed) != num_jobs as u32 {
+                sleep(Duration::from_millis(1)).await;
+            }
+            // Success! Drop the channel sender so that the pipeline can finish. (Making this block
+            // `async move` would automatically drop the sender here, but it would make it annoying
+            // to work with the other shared values.)
+            drop(sender);
+        })
+        .await;
     }
 }
