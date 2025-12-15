@@ -105,6 +105,7 @@ use std::task::{Context, Poll, Poll::Pending, Poll::Ready};
 #[derive(Debug)]
 struct BufferInner<T> {
     items: VecDeque<T>,
+    limit: usize,
     is_closed: bool,
     // This waker is only used in the backwards direction, when a later stage wakes up a prior one
     // by clearing space in its output buffer. Wakers aren't needed in the forward direction,
@@ -116,9 +117,10 @@ struct BufferInner<T> {
 struct Buffer<T>(Arc<AtomicRefCell<BufferInner<T>>>);
 
 impl<T> Buffer<T> {
-    fn new(capacity: usize) -> Self {
+    fn new(limit: usize) -> Self {
         Self(Arc::new(AtomicRefCell::new(BufferInner {
-            items: VecDeque::with_capacity(capacity),
+            items: VecDeque::new(),
+            limit,
             is_closed: false,
             sender_waker: None,
         })))
@@ -126,7 +128,7 @@ impl<T> Buffer<T> {
 
     fn push(&self, item: T) {
         let mut this = self.0.borrow_mut();
-        assert!(this.items.len() < this.items.capacity());
+        assert!(this.items.len() < this.limit);
         assert!(!this.is_closed);
         this.items.push_back(item);
     }
@@ -763,5 +765,15 @@ mod tests {
             drop(sender);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_dont_preallocate_buffers() {
+        // This would crash if we tried to preallocate the whole buffer, but the default VecDeque
+        // growing behavior works fine.
+        AsyncPipeline::from_iter(0..10)
+            .map_concurrent(async |x| x + 1, usize::MAX)
+            .for_each(async |_| {})
+            .await;
     }
 }
