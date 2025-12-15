@@ -1,6 +1,6 @@
 [package]
 name = "roughage"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Jack O'Connor <oconnor663@gmail.com>"]
 description = "provides `AsyncPipeline`, a deadlock-free replacement for buffered streams"
 repository = "https://github.com/oconnor663/roughage"

@@ -25,12 +25,12 @@
 //!
 //! static LOCK: Mutex<()> = Mutex::const_new(());
 //!
-//! // An innocent example function that touches an async lock. Note that the deadlocks below can
-//! // happen even if this function is buried three crates deep in some dependency you never see.
+//! // An innocent example function that touches an async lock. Note
+//! // that the deadlocks below can happen even if this function is
+//! // buried three crates deep in some dependency you never see.
 //! async fn foo() {
 //!     let _guard = LOCK.lock().await;
 //!     sleep(Duration::from_millis(1)).await;
-//!     // It *looks like* `foo` is guaranteed to release this lock after 1 ms...
 //! }
 //!
 //! # #[tokio::main]
