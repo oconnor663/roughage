@@ -105,6 +105,8 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::task::{Context, Poll, Poll::Pending, Poll::Ready};
 
+pub mod async_iterator;
+
 #[derive(Debug)]
 struct BufferInner<T> {
     items: VecDeque<T>,
