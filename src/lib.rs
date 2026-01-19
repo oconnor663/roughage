@@ -1,6 +1,12 @@
 //! This crate provides a single type, [`AsyncPipeline`], which is an alternative to [`buffered`]
 //! streams, [`FuturesOrdered`], and [`FuturesUnordered`].
 //!
+//! **This crate is going to be refactored substantially to work more like [`futures::StreamExt`].
+//! Also both `StreamExt` and this crate will need to be migrated to `AsyncFn`/`AsyncFnMut` once it
+//! becomes possible to spell their associated future types in stable Rust.**
+//!
+//! [`futures::StreamExt`]: https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html
+//!
 //! All of those are prone to deadlocks if any of their buffered/concurrent futures touches an
 //! async lock of any kind, _even indirectly_. (For example, note that [`tokio::sync::mpsc`]
 //! channels [use a `Semaphore` internally][internally].) The problem is that they don't
