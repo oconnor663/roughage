@@ -477,4 +477,20 @@ mod tests {
             .await;
         assert_eq!(max_concurrency.load(Relaxed), 6);
     }
+
+    // At the time of writing, this test deadlocks if either of the `.poll_progress()` calls in
+    // `FilterMap::poll_progress` or `ForEach::poll` are removed.
+    #[tokio::test]
+    async fn test_deadlocks() {
+        futures::stream::iter(0..100)
+            .filter_map_concurrent(async |i| Some(foo(i).await), Some(3))
+            .filter_map_concurrent(async |i| Some(foo(i).await), Some(1))
+            .for_each_concurrent(
+                async |i| {
+                    foo(i).await;
+                },
+                Some(1),
+            )
+            .await;
+    }
 }
