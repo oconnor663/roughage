@@ -12,46 +12,81 @@ pub trait AsyncIterator {
     // TODO: Should this return Poll<()> to indicate whether a wakeup is scheduled?
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>);
 
-    fn buffered(self, limit: impl Into<Option<usize>>) -> Buffered<Self>
+    fn filter_map_concurrent<F, Fut, T>(
+        self,
+        f: F,
+        limit: impl Into<Option<usize>>,
+    ) -> FilterMap<Self, F, Fut, T>
     where
         Self: Sized,
-        Self::Item: Future,
+        F: FnMut(Self::Item) -> Fut,
+        Fut: Future<Output = Option<T>>,
     {
-        Buffered {
+        FilterMap {
             iter: Some(self),
+            f,
             executor: crate::Executor::new(crate::ExecutorKind::Ordered),
             items: VecDeque::new(),
             limit: limit.into(),
         }
     }
 
-    fn buffer_unordered(self, limit: impl Into<Option<usize>>) -> Buffered<Self>
+    fn filter_map_unordered<F, Fut, T>(
+        self,
+        f: F,
+        limit: impl Into<Option<usize>>,
+    ) -> FilterMap<Self, F, Fut, T>
+    where
+        Self: Sized,
+        F: FnMut(Self::Item) -> Fut,
+        Fut: Future<Output = Option<T>>,
+    {
+        FilterMap {
+            iter: Some(self),
+            f,
+            executor: crate::Executor::new(crate::ExecutorKind::Unordered),
+            items: VecDeque::new(),
+            limit: limit.into(),
+        }
+    }
+
+    fn buffered(
+        self,
+        limit: impl Into<Option<usize>>,
+    ) -> impl AsyncIterator<Item = <Self::Item as Future>::Output>
     where
         Self: Sized,
         Self::Item: Future,
     {
-        Buffered {
-            iter: Some(self),
-            items: VecDeque::new(),
-            executor: crate::Executor::new(crate::ExecutorKind::Unordered),
-            limit: limit.into(),
-        }
+        self.filter_map_concurrent(|fut| async move { Some(fut.await) }, limit)
+    }
+
+    fn buffer_unordered(
+        self,
+        limit: impl Into<Option<usize>>,
+    ) -> impl AsyncIterator<Item = <Self::Item as Future>::Output>
+    where
+        Self: Sized,
+        Self::Item: Future,
+    {
+        self.filter_map_unordered(|fut| async move { Some(fut.await) }, limit)
     }
 
     fn for_each_concurrent<F, Fut>(
         self,
         f: F,
         limit: impl Into<Option<usize>>,
-    ) -> ForEachConcurrent<Self, F, Fut>
+    ) -> ForEach<Self, F, Fut>
     where
         Self: Sized,
         F: FnMut(Self::Item) -> Fut,
         Fut: Future<Output = ()>,
     {
-        ForEachConcurrent {
+        ForEach {
             iter: Some(self),
             f,
-            executor: crate::Executor::new(crate::ExecutorKind::Ordered),
+            // This combinator has no output, so it never needs to be ordered.
+            executor: crate::Executor::new(crate::ExecutorKind::Unordered),
             limit: limit.into(),
         }
     }
@@ -79,26 +114,29 @@ impl<S: Stream> AsyncIterator for S {
 }
 
 pin_project_lite::pin_project! {
-    #[must_use = "`AsyncIterator`s do nothing unless you `.for_each()` or `.collect()` them"]
-    pub struct Buffered<I>
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    pub struct FilterMap<I, F, Fut, T>
     where
         I: AsyncIterator,
-        I::Item: Future,
+        F: FnMut(I::Item) -> Fut,
+        Fut: Future<Output = Option<T>>,
     {
         #[pin]
         iter: Option<I>,
-        executor: crate::Executor<I::Item>,
-        items: VecDeque<<I::Item as Future>::Output>,
+        f: F,
+        executor: crate::Executor<Fut>,
+        items: VecDeque<T>,
         limit: Option<usize>,
     }
 }
 
-impl<I> AsyncIterator for Buffered<I>
+impl<I, F, Fut, T> AsyncIterator for FilterMap<I, F, Fut, T>
 where
     I: AsyncIterator,
-    I::Item: Future,
+    F: FnMut(I::Item) -> Fut,
+    Fut: Future<Output = Option<T>>,
 {
-    type Item = <I::Item as Future>::Output;
+    type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.as_mut().poll_progress(cx);
@@ -123,7 +161,7 @@ where
             if has_capacity && let Some(iter) = this.iter.as_mut().as_pin_mut() {
                 match iter.poll_next(cx) {
                     Poll::Ready(Some(fut)) => {
-                        this.executor.push(fut);
+                        this.executor.push((this.f)(fut));
                         progress = true;
                     }
                     Poll::Ready(None) => {
@@ -132,10 +170,16 @@ where
                     Poll::Pending => {}
                 }
             }
-            // Try to complete any buffered futures.
-            if let Poll::Ready(Some(output)) = this.executor.poll_next(cx) {
-                this.items.push_back(output);
+            // Try to complete any buffered futures. Each future return either `Some(item)` or
+            // `None`, so we have a doubly nested Option here. However, note that returning `None`
+            // still counts as making progress, because it clears space in the buffer. Also note
+            // that the executor returns `Ready(None)` when it's empty, but we never consider it
+            // "finished". It's a unusual stream.
+            if let Poll::Ready(Some(maybe_item)) = this.executor.poll_next(cx) {
                 progress = true;
+                if let Some(item) = maybe_item {
+                    this.items.push_back(item);
+                }
             }
             if !progress {
                 break;
@@ -146,7 +190,7 @@ where
 
 pin_project_lite::pin_project! {
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct ForEachConcurrent<I, F, Fut>
+    pub struct ForEach<I, F, Fut>
     where
         I: AsyncIterator,
         F: FnMut(I::Item) -> Fut,
@@ -155,13 +199,12 @@ pin_project_lite::pin_project! {
         #[pin]
         iter: Option<I>,
         f: F,
-        // This combinator has no output, so it never needs to be ordered.
         executor: crate::Executor<Fut>,
         limit: Option<usize>,
     }
 }
 
-impl<I, F, Fut> Future for ForEachConcurrent<I, F, Fut>
+impl<I, F, Fut> Future for ForEach<I, F, Fut>
 where
     I: AsyncIterator,
     F: FnMut(I::Item) -> Fut,
@@ -276,6 +319,51 @@ mod tests {
         let _guard = LOCK.lock();
         tokio::time::sleep(Duration::from_millis(rand::random_range(0..10))).await;
         i
+    }
+
+    #[tokio::test]
+    async fn test_filter_map_concurrent() {
+        let counter = AtomicU32::new(0);
+        futures::stream::iter(0..100)
+            .filter_map_concurrent(
+                async |i| if i < 50 { Some(foo(i).await) } else { None },
+                None,
+            )
+            .filter_map_concurrent(
+                async |i| if i % 2 == 0 { Some(foo(i).await) } else { None },
+                None,
+            )
+            .for_each_concurrent(
+                async |i| {
+                    assert_eq!(counter.load(Relaxed), i);
+                    counter.store(i + 2, Relaxed);
+                    // Try to provoke more deadlocks.
+                    foo(i).await;
+                },
+                None,
+            )
+            .await;
+        assert_eq!(counter.load(Relaxed), 50);
+    }
+
+    #[tokio::test]
+    async fn test_filter_map_unordered() {
+        let mut items: Vec<u32> = futures::stream::iter(0..100)
+            .filter_map_unordered(
+                async |i| if i < 50 { Some(foo(i).await) } else { None },
+                None,
+            )
+            .filter_map_unordered(
+                async |i| if i % 2 == 0 { Some(foo(i).await) } else { None },
+                None,
+            )
+            .collect()
+            .await;
+        // Given the random sleeps, it's vanishingly unlikely that the order will match at first.
+        let expected: Vec<u32> = (0..25).map(|i| 2 * i).collect();
+        assert_ne!(items, expected);
+        items.sort_unstable();
+        assert_eq!(items, expected);
     }
 
     #[tokio::test]
