@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 #[must_use = "`AsyncIterator`s do nothing unless you `.for_each()` or `.collect()` them"]
-pub trait AsyncIterator {
+pub trait AsyncIterator: Sized {
     type Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>>;
@@ -18,7 +18,6 @@ pub trait AsyncIterator {
         limit: impl Into<Option<usize>>,
     ) -> FilterMap<Self, F, Fut, T>
     where
-        Self: Sized,
         F: FnMut(Self::Item) -> Fut,
         Fut: Future<Output = Option<T>>,
     {
@@ -37,7 +36,6 @@ pub trait AsyncIterator {
         limit: impl Into<Option<usize>>,
     ) -> FilterMap<Self, F, Fut, T>
     where
-        Self: Sized,
         F: FnMut(Self::Item) -> Fut,
         Fut: Future<Output = Option<T>>,
     {
@@ -55,7 +53,6 @@ pub trait AsyncIterator {
         limit: impl Into<Option<usize>>,
     ) -> impl AsyncIterator<Item = <Self::Item as Future>::Output>
     where
-        Self: Sized,
         Self::Item: Future,
     {
         self.filter_map_concurrent(|fut| async move { Some(fut.await) }, limit)
@@ -66,7 +63,6 @@ pub trait AsyncIterator {
         limit: impl Into<Option<usize>>,
     ) -> impl AsyncIterator<Item = <Self::Item as Future>::Output>
     where
-        Self: Sized,
         Self::Item: Future,
     {
         self.filter_map_unordered(|fut| async move { Some(fut.await) }, limit)
@@ -78,7 +74,6 @@ pub trait AsyncIterator {
         limit: impl Into<Option<usize>>,
     ) -> ForEach<Self, F, Fut>
     where
-        Self: Sized,
         F: FnMut(Self::Item) -> Fut,
         Fut: Future<Output = ()>,
     {
@@ -93,7 +88,6 @@ pub trait AsyncIterator {
 
     fn collect<C>(self) -> Collect<Self, C>
     where
-        Self: Sized,
         C: Default + Extend<Self::Item>,
     {
         Collect {
